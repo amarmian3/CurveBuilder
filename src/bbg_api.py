@@ -195,3 +195,88 @@ def pyxll_bbg_disconnect():
                 _BQ.stop()
             finally:
                 _BQ = None
+
+
+import pandas as pd
+from typing import Sequence, Union, Optional
+
+def get_intraday(
+    con,                                   # pdblp.BCon (already start()'ed)
+    tickers: Union[str, Sequence[str]],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    interval: int = 0,                     # 0 -> tick (bdit), >0 -> bars (bdib)
+    event_type: str = "TRADE",
+    tz: Optional[str] = None,              # e.g. "Europe/London"
+    fields: Optional[Sequence[str]] = None,# subset of fields to keep
+    long: bool = False                     # return long/“tidy” instead of wide
+) -> pd.DataFrame:
+    """
+    Returns:
+      - Wide: index=DatetimeIndex, columns=MultiIndex[(ticker, field)]
+      - Long (if long=True): columns=['time','ticker','field','value']
+    """
+    if isinstance(tickers, str):
+        tickers = [tickers]
+
+    out = []
+    for tk in tickers:
+        if interval == 0:
+            # ---- Ticks
+            df = con.bdit(tk, start, end, eventType=event_type)
+            # Expected columns often: ['time','type','value','size'] (pdblp)
+            if 'time' not in df.columns:
+                raise ValueError(f"Unexpected tick schema for {tk}: {df.columns.tolist()}")
+            df = df.set_index('time')
+            # Standardize names; keep only known numeric fields
+            rename_map = {'value': 'PRICE', 'size': 'SIZE'}
+            df = df.rename(columns=rename_map)
+            keep = [c for c in ['PRICE', 'SIZE'] if c in df.columns]
+            if fields is not None:
+                keep = [c for c in keep if c in set(fields)]
+            df = df[keep]
+        else:
+            # ---- Bars
+            # pdblp typically accepts datetimes directly
+            df = con.bdib(tk, start, end, interval, eventType=event_type)
+            # Expected columns include: open, high, low, close, volume, ...
+            if 'time' not in df.columns and 'datetime' in df.columns:
+                df = df.rename(columns={'datetime': 'time'})
+            if 'time' not in df.columns:
+                raise ValueError(f"Unexpected bar schema for {tk}: {df.columns.tolist()}")
+            df = df.set_index('time')
+            rename_map = {
+                'open': 'OPEN', 'high': 'HIGH', 'low': 'LOW', 'close': 'CLOSE',
+                'volume': 'VOLUME', 'numEvents': 'NUM_EVENTS', 'value': 'VALUE'
+            }
+            df = df.rename(columns=rename_map)
+            keep = [c for c in ['OPEN','HIGH','LOW','CLOSE','VOLUME','NUM_EVENTS','VALUE'] if c in df.columns]
+            if fields is not None:
+                keep = [c for c in keep if c in set(fields)]
+            df = df[keep]
+
+        # Timezone handling
+        if tz is not None:
+            if df.index.tz is None:
+                df.index = df.index.tz_localize(tz)  # assume provided times are in tz
+            else:
+                df.index = df.index.tz_convert(tz)
+
+        # Add ticker level
+        df.columns = pd.MultiIndex.from_product([[tk], df.columns], names=['ticker','field'])
+        out.append(df)
+
+    # Align on time; outer join keeps all timestamps across tickers
+    wide = pd.concat(out, axis=1).sort_index()
+
+    if long:
+        long_df = (
+            wide.stack('ticker')
+                .stack('field')
+                .rename('value')
+                .reset_index()
+                .rename(columns={'level_0':'time'})
+        )
+        return long_df
+
+    return wide
